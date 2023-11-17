@@ -2,7 +2,7 @@ use super::constants::{
 	BE_SIGNED_INTEGER, BE_UNSIGNED_INTEGER, BMP, JPEG, PNG, RESERVED, UTF16, UTF8,
 };
 use super::{Atom, AtomData, AtomIdent, Ilst};
-use crate::error::Result;
+use crate::error::{ErrorKind, Result};
 use crate::id3::v1::constants::GENRES;
 use crate::macros::{err, try_vec};
 use crate::mp4::atom_info::AtomInfo;
@@ -10,8 +10,9 @@ use crate::mp4::ilst::atom::AtomDataStorage;
 use crate::mp4::read::{skip_unneeded, AtomReader};
 use crate::picture::{MimeType, Picture, PictureType};
 use crate::util::text::{utf16_decode_bytes, utf8_decode};
-use crate::ParsingMode;
-
+use crate::{LoftyError, ParsingMode};
+use encoding::all::GBK;
+use encoding::{DecoderTrap, Encoding};
 use std::borrow::Cow;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
@@ -148,26 +149,33 @@ where
 		// Most atoms we encounter are only going to have 1 value, so store them as such
 		if atom_data.len() == 1 {
 			let (flags, content) = atom_data.remove(0);
-			let data = interpret_atom_content(flags, content)?;
-
-			tag.atoms.push(Atom {
-				ident: atom_info.ident,
-				data: AtomDataStorage::Single(data),
-			});
-
+			let data = interpret_atom_content(flags, content);
+			match data {
+				Ok(a) => tag.atoms.push(Atom {
+					ident: atom_info.ident,
+					data: AtomDataStorage::Single(a),
+				}),
+				Err(e) => println!("skip the tag, because {}", e),
+			}
 			return Ok(());
 		}
 
 		let mut data = Vec::new();
+		let mut has_error: bool = false;
 		for (flags, content) in atom_data {
-			let value = interpret_atom_content(flags, content)?;
-			data.push(value);
+			let value = interpret_atom_content(flags, content);
+			if value.as_ref().err().is_none() {
+				has_error = true;
+				break;
+			}
+			data.push(value?);
 		}
-
-		tag.atoms.push(Atom {
-			ident: atom_info.ident,
-			data: AtomDataStorage::Multiple(data),
-		});
+		if !has_error {
+			tag.atoms.push(Atom {
+				ident: atom_info.ident,
+				data: AtomDataStorage::Multiple(data),
+			});
+		}
 	}
 
 	Ok(())
@@ -317,7 +325,21 @@ where
 fn interpret_atom_content(flags: u32, content: Vec<u8>) -> Result<AtomData> {
 	// https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/Metadata/Metadata.html#//apple_ref/doc/uid/TP40000939-CH1-SW35
 	Ok(match flags {
-		UTF8 => AtomData::UTF8(utf8_decode(content)?),
+		UTF8 => {
+			let utf8_str = utf8_decode(content.clone());
+			match utf8_str {
+				Ok(c) => AtomData::UTF8(c),
+				Err(e) => {
+					println!("Error: {}, try to GBK decode", e);
+					let c = GBK
+						.decode(content.as_slice(), DecoderTrap::Strict)
+						.map_err(|_| {
+							LoftyError::new(ErrorKind::TextDecode("Fail to try as GBK string"))
+						})?;
+					AtomData::UTF8(c)
+				},
+			}
+		},
 		UTF16 => AtomData::UTF16(utf16_decode_bytes(&content, u16::from_be_bytes)?),
 		BE_SIGNED_INTEGER => AtomData::SignedInteger(parse_int(&content)?),
 		BE_UNSIGNED_INTEGER => AtomData::UnsignedInteger(parse_uint(&content)?),
